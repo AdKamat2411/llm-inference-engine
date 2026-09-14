@@ -60,13 +60,10 @@ struct Weights {
     __nv_bfloat16 *norm;
 };
 
-struct PagedKVCache {
+struct SharedCache {
     __nv_bfloat16 *k; // k_cache[layer][block][token][kv_dim]
     __nv_bfloat16 *v;
-    int *device_block_table;
-
     std::vector<int> free_blocks;
-    std::vector<int> block_table;
 };
 
 int loadWeights(Weights &weights) {
@@ -145,8 +142,23 @@ constexpr int VOCAB_SIZE = 128256;
 constexpr int END_OF_SEQ = 128009;
 constexpr int BLOCK_SIZE = 16;
 constexpr int NUM_BLOCKS = 1024;
+constexpr int MAX_ACTIVE_REQUESTS = 1;
+constexpr int MAX_NEW_TOKENS = 100;
 
-enum class InferencePhase { Prefill, Decode };
+enum class InferencePhase { Waiting, Prefill, Decode, Done };
+
+struct Request {
+    std::vector<int> input_tokens;
+    int *gpu_input_tokens = nullptr;
+    __nv_bfloat16 *hidden_state = nullptr;
+    int *device_block_table = nullptr;
+    std::vector<int> block_table;
+    int next_token = 0;
+    int cached_tokens = 0;
+    InferencePhase inference_phase;
+    std::vector<int> generated_tokens;
+};
+
 
 void linear(cublasHandle_t handle, __nv_bfloat16 *input, __nv_bfloat16 *weight,
             __nv_bfloat16 *output, int num_tokens, int input_size, int output_size) {
@@ -271,15 +283,15 @@ struct InferenceWorkspace {
 
 void runLayer(cublasHandle_t handle, const Weights &weights,
               __nv_bfloat16 *hidden_state, int layer, int query_tokens,
-              int position, InferencePhase phase, PagedKVCache &paged_cache,
+              int position, InferencePhase phase, SharedCache &cache, Request &request,
               InferenceWorkspace &workspace) {
     int logical_block = position / BLOCK_SIZE;
     int slot = position % BLOCK_SIZE;
-    int block_num = paged_cache.block_table[logical_block];
+    int block_num = request.block_table[logical_block];
     int offset = ((layer * NUM_BLOCKS + block_num) * BLOCK_SIZE + slot) * KV_SIZE;
 
-    __nv_bfloat16 *k_write = paged_cache.k + offset;
-    __nv_bfloat16 *v_write = paged_cache.v + offset;
+    __nv_bfloat16 *k_write = cache.k + offset;
+    __nv_bfloat16 *v_write = cache.v + offset;
     __nv_bfloat16 *k_proj = phase == InferencePhase::Prefill ? workspace.k_proj : k_write;
     __nv_bfloat16 *v_proj = phase == InferencePhase::Prefill ? workspace.v_proj : v_write;
 
@@ -306,8 +318,8 @@ void runLayer(cublasHandle_t handle, const Weights &weights,
         gqa(handle, workspace.q_proj, k_proj, v_proj, workspace.attn_scores,
             workspace.attn_output, query_tokens, kv_tokens, phase);
     } else {
-        pagedAttentionDecode(workspace.q_proj, paged_cache.k, paged_cache.v,
-                             workspace.attn_output, paged_cache.device_block_table,
+        pagedAttentionDecode(workspace.q_proj, cache.k, cache.v,
+                             workspace.attn_output, request.device_block_table,
                              kv_tokens, layer);
     }
 
@@ -316,12 +328,12 @@ void runLayer(cublasHandle_t handle, const Weights &weights,
     if (phase == InferencePhase::Prefill) {
         for (int i = 0; i < query_tokens; i++) {
             p = position + i;
-            int dest_block = paged_cache.block_table[p / BLOCK_SIZE];
+            int dest_block = request.block_table[p / BLOCK_SIZE];
             int dest_slot = p % BLOCK_SIZE;
             int dest_offset = ((layer * NUM_BLOCKS + dest_block) * BLOCK_SIZE + dest_slot) * KV_SIZE;
 
-            __nv_bfloat16 *dest_k = paged_cache.k + dest_offset;
-            __nv_bfloat16 *dest_v = paged_cache.v + dest_offset;
+            __nv_bfloat16 *dest_k = cache.k + dest_offset;
+            __nv_bfloat16 *dest_v = cache.v + dest_offset;
             cudaMemcpy(dest_k, workspace.k_proj + i * KV_SIZE, KV_SIZE * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
             cudaMemcpy(dest_v, workspace.v_proj + i * KV_SIZE, KV_SIZE * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
         }
@@ -368,32 +380,92 @@ int selectNextToken(cublasHandle_t handle, const Weights &weights,
     return next_token;
 }
 
-int prefill(cublasHandle_t handle, const Weights &weights, __nv_bfloat16 *hidden_state, int num_tokens, PagedKVCache &paged_cache) {
+void prefill(cublasHandle_t handle, const Weights &weights,
+             SharedCache &cache, Request &request) {
+    int num_tokens = static_cast<int>(request.input_tokens.size());
     InferenceWorkspace workspace(
         MAX_PROMPT_LEN, static_cast<std::size_t>(32) * MAX_PROMPT_LEN * MAX_PROMPT_LEN);
     for (int layer = 0; layer < N_LAYERS; ++layer) {
-        runLayer(handle, weights, hidden_state, layer, num_tokens, 0,
-                 InferencePhase::Prefill, paged_cache, workspace);
+        runLayer(handle, weights, request.hidden_state, layer, num_tokens, 0,
+                 InferencePhase::Prefill, cache, request, workspace);
     }
-    return selectNextToken(handle, weights, hidden_state, num_tokens, workspace);
+    request.next_token = selectNextToken(handle, weights, request.hidden_state, num_tokens, workspace);
+    request.cached_tokens = num_tokens;
 }
 
-int decode(cublasHandle_t handle, const Weights &weights, __nv_bfloat16 *hidden_state, int num_tokens, PagedKVCache &paged_cache) {
-    int logical_block = num_tokens / BLOCK_SIZE;
-    if (logical_block == static_cast<int>(paged_cache.block_table.size())) {
-        int physical_block = paged_cache.free_blocks.back();
-        paged_cache.free_blocks.pop_back();
-        paged_cache.block_table.push_back(physical_block);
-        cudaMemcpy(paged_cache.device_block_table + logical_block, &physical_block,
-                   sizeof(physical_block), cudaMemcpyHostToDevice);
+void allocateBlocks(SharedCache &cache, Request &request, int blocks_needed) {
+    int block_idx;
+    for (int i = 0; i < blocks_needed; i++) {
+        block_idx = cache.free_blocks.back();
+        request.block_table.push_back(block_idx);
+        cache.free_blocks.pop_back();
+    }
+    cudaMemcpy(request.device_block_table, request.block_table.data(),
+               request.block_table.size() * sizeof(int), cudaMemcpyHostToDevice);
+}
+
+void releaseBlocks(SharedCache &cache, Request &request) {
+    for (int block : request.block_table) {
+        cache.free_blocks.push_back(block);
+    }
+    request.block_table.clear();
+}
+
+bool setupRequest(SharedCache &cache, const Weights &weights, Request &request) {
+    int num_tokens = static_cast<int>(request.input_tokens.size());
+    int blocks_needed = (num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (num_tokens == 0 || num_tokens > MAX_PROMPT_LEN ||
+        blocks_needed > static_cast<int>(cache.free_blocks.size())) {
+        return false;
+    }
+
+    if (cudaMalloc(&request.gpu_input_tokens, num_tokens * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&request.hidden_state,
+                   static_cast<std::size_t>(MAX_PROMPT_LEN) * HIDDEN_SIZE * sizeof(__nv_bfloat16)) != cudaSuccess ||
+        cudaMalloc(&request.device_block_table,
+                   ((MAX_SEQ_LEN + BLOCK_SIZE - 1) / BLOCK_SIZE) * sizeof(int)) != cudaSuccess) {
+        cudaFree(request.gpu_input_tokens);
+        cudaFree(request.hidden_state);
+        cudaFree(request.device_block_table);
+        request.gpu_input_tokens = nullptr;
+        request.hidden_state = nullptr;
+        request.device_block_table = nullptr;
+        return false;
+    }
+
+    cudaMemcpy(request.gpu_input_tokens, request.input_tokens.data(),
+               num_tokens * sizeof(int), cudaMemcpyHostToDevice);
+    embeddingGather(request.gpu_input_tokens, request.hidden_state,
+                    weights.embed_tokens, num_tokens);
+    allocateBlocks(cache, request, blocks_needed);
+    return true;
+}
+
+void releaseRequest(SharedCache &cache, Request &request) {
+    releaseBlocks(cache, request);
+    cudaFree(request.gpu_input_tokens);
+    cudaFree(request.hidden_state);
+    cudaFree(request.device_block_table);
+    request.gpu_input_tokens = nullptr;
+    request.hidden_state = nullptr;
+    request.device_block_table = nullptr;
+}
+
+void decode(cublasHandle_t handle, const Weights &weights,
+            SharedCache &cache, Request &request) {
+    int position = request.cached_tokens;
+    int logical_block = position / BLOCK_SIZE;
+    if (logical_block == static_cast<int>(request.block_table.size())) {
+        allocateBlocks(cache, request, 1);
     }
 
     InferenceWorkspace workspace(1, static_cast<std::size_t>(32) * MAX_SEQ_LEN);
     for (int layer = 0; layer < N_LAYERS; ++layer) {
-        runLayer(handle, weights, hidden_state, layer, 1, num_tokens,
-                 InferencePhase::Decode, paged_cache, workspace);
+        runLayer(handle, weights, request.hidden_state, layer, 1, position,
+                 InferencePhase::Decode, cache, request, workspace);
     }
-    return selectNextToken(handle, weights, hidden_state, 1, workspace);
+    request.next_token = selectNextToken(handle, weights, request.hidden_state, 1, workspace);
+    request.cached_tokens++;
 }
 
 int main() {
@@ -402,61 +474,83 @@ int main() {
         return 1;
     }
 
-    std::vector<int> input_tokens = {791, 6864, 315, 9822, 374};
+    std::vector<Request> requests;
+    std::queue<int> waiting;   // request indices waiting for prefill
+    std::vector<int> active;   // admitted request indices
+
+    Request request1{};
+    request1.input_tokens = {791, 6864, 315, 9822, 374};
+    request1.inference_phase = InferencePhase::Waiting;
+
+    Request request2{};
+    request2.input_tokens = {678, 264, 1933, 13};
+    request2.inference_phase = InferencePhase::Waiting;
+
+    requests.push_back(request1);
+    requests.push_back(request2);
+    waiting.push(0);
+    waiting.push(1);
+
     cublasHandle_t handle;
     cublasCreate(&handle);
 
-    int *gpu_input_tokens;
-
-    cudaMalloc(&gpu_input_tokens, MAX_PROMPT_LEN * sizeof(int));
-    cudaMemcpy(gpu_input_tokens, input_tokens.data(), input_tokens.size() * sizeof(int), cudaMemcpyHostToDevice);
-
-    __nv_bfloat16 *input_embeddings;
-    cudaMalloc(&input_embeddings, MAX_PROMPT_LEN * sizeof(__nv_bfloat16) * 2048);
-    embeddingGather(gpu_input_tokens, input_embeddings, weights.embed_tokens, input_tokens.size());
-
-    // this loop output is next loop's input
-    __nv_bfloat16 *hidden_state;
-    cudaMalloc(&hidden_state, MAX_PROMPT_LEN * sizeof(__nv_bfloat16) * HIDDEN_SIZE);
-    int num_tokens = static_cast<int>(input_tokens.size());
-    cudaMemcpy(hidden_state, input_embeddings,
-               num_tokens * HIDDEN_SIZE * sizeof(__nv_bfloat16),
-               cudaMemcpyDeviceToDevice);
-
-    PagedKVCache paged_cache{};
+    SharedCache cache{};
     for (int i = NUM_BLOCKS - 1; i >= 0; i--) {
-        paged_cache.free_blocks.push_back(i);
+        cache.free_blocks.push_back(i);
     }
-    cudaMalloc(&paged_cache.k, BLOCK_SIZE * NUM_BLOCKS* sizeof(__nv_bfloat16) * KV_SIZE * N_LAYERS);
-    cudaMalloc(&paged_cache.v, BLOCK_SIZE * NUM_BLOCKS* sizeof(__nv_bfloat16) * KV_SIZE * N_LAYERS);
-    cudaMalloc(&paged_cache.device_block_table, NUM_BLOCKS * sizeof(int));
+    cudaMalloc(&cache.k, BLOCK_SIZE * NUM_BLOCKS* sizeof(__nv_bfloat16) * KV_SIZE * N_LAYERS);
+    cudaMalloc(&cache.v, BLOCK_SIZE * NUM_BLOCKS* sizeof(__nv_bfloat16) * KV_SIZE * N_LAYERS);
 
-    int num_blocks_to_allocate = (num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    int block_idx;
-    for (int i = 0; i < num_blocks_to_allocate; i++) {
-        block_idx = paged_cache.free_blocks.back();
-        paged_cache.block_table.push_back(block_idx);
-        paged_cache.free_blocks.pop_back();
+    while (!waiting.empty() || !active.empty()) {
+        while (active.size() < MAX_ACTIVE_REQUESTS && !waiting.empty()) {
+            int request_id = waiting.front();
+            Request &front_request = requests[request_id];
+            front_request.inference_phase = InferencePhase::Prefill;
+            if (!setupRequest(cache, weights, front_request)) {
+                std::cerr << "Could not set up request\n";
+                cudaFree(cache.k);
+                cudaFree(cache.v);
+                cublasDestroy(handle);
+                return 1;
+            }
+            active.push_back(request_id);
+            waiting.pop();
+        }
+
+        std::vector<int> remaining;
+        for (int req_id : active) {
+            Request &active_req = requests[req_id];
+            if (active_req.inference_phase == InferencePhase::Prefill) {
+                prefill(handle, weights, cache, active_req);
+                active_req.inference_phase = InferencePhase::Decode;
+            } else if (active_req.inference_phase == InferencePhase::Decode) {
+                cudaMemcpy(active_req.gpu_input_tokens, &active_req.next_token,
+                           sizeof(active_req.next_token), cudaMemcpyHostToDevice);
+                embeddingGather(active_req.gpu_input_tokens, active_req.hidden_state,
+                                weights.embed_tokens, 1);
+                decode(handle, weights, cache, active_req);
+            }
+
+            if (active_req.next_token != END_OF_SEQ && active_req.cached_tokens < MAX_SEQ_LEN) {
+                active_req.generated_tokens.push_back(active_req.next_token);
+                std::cout << "Generated token ID: " << active_req.next_token << '\n';
+            }
+
+            bool finished = active_req.next_token == END_OF_SEQ ||
+                            active_req.cached_tokens >= MAX_SEQ_LEN ||
+                            active_req.generated_tokens.size() >= MAX_NEW_TOKENS;
+            if (finished) {
+                releaseRequest(cache, active_req);
+                active_req.inference_phase = InferencePhase::Done;
+            } else {
+                remaining.push_back(req_id);
+            }
+        }
+        active.swap(remaining);
     }
-    cudaMemcpy(paged_cache.device_block_table, paged_cache.block_table.data(),
-               paged_cache.block_table.size() * sizeof(int), cudaMemcpyHostToDevice);
 
-
-    int next_token = prefill(handle, weights, hidden_state, num_tokens, paged_cache);
-    while (next_token != END_OF_SEQ && num_tokens < MAX_SEQ_LEN) {
-        std::cout << "Generated token ID: " << next_token << '\n';
-        cudaMemcpy(gpu_input_tokens, &next_token, sizeof(next_token), cudaMemcpyHostToDevice);
-        embeddingGather(gpu_input_tokens, hidden_state, weights.embed_tokens, 1);
-        next_token = decode(handle, weights, hidden_state, num_tokens, paged_cache);
-        num_tokens++;
-    }
-
-    cudaFree(gpu_input_tokens);
-    cudaFree(input_embeddings);
-    cudaFree(hidden_state);
-    cudaFree(paged_cache.device_block_table);
-    cudaFree(paged_cache.k);
-    cudaFree(paged_cache.v);
+    cudaFree(cache.k);
+    cudaFree(cache.v);
     cublasDestroy(handle);
     return 0;
 }
