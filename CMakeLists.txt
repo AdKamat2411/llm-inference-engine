@@ -29,3 +29,11 @@ add_executable(my-tiny-vllm
 
 target_include_directories(my-tiny-vllm PRIVATE src include)
 target_link_libraries(my-tiny-vllm PRIVATE CUDA::cublas CUDA::cudart)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(decode-softmax-test tests/decode_softmax.cu src/kernels.cu)
+    target_include_directories(decode-softmax-test PRIVATE src)
+    target_link_libraries(decode-softmax-test PRIVATE CUDA::cudart)
+    add_test(NAME decode-softmax COMMAND decode-softmax-test)
+endif()

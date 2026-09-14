@@ -179,12 +179,70 @@ void softmax(__nv_bfloat16 *input, int num_tokens) {
     softmaxKernel<<<num_tokens * 32, num_tokens>>>(input, num_tokens);
 }
 
+__device__ void softmaxSharedRow(float *scores, float *partial, int seq_len) {
+    int lane = threadIdx.x;
+    float local_max = -INFINITY;
+    for (int token = lane; token < seq_len; token += blockDim.x) {
+        local_max = fmaxf(local_max, scores[token]);
+    }
+    partial[lane] = local_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            partial[lane] = fmaxf(partial[lane], partial[lane + stride]);
+        }
+        __syncthreads();
+    }
+
+    float max_val = partial[0];
+    __syncthreads();
+    float local_sum = 0.0f;
+    for (int token = lane; token < seq_len; token += blockDim.x) {
+        float value = expf(scores[token] - max_val);
+        scores[token] = value;
+        local_sum += value;
+    }
+    partial[lane] = local_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        __syncthreads();
+    }
+
+    float inv_sum = 1.0f / partial[0];
+    for (int token = lane; token < seq_len; token += blockDim.x) {
+        scores[token] *= inv_sum;
+    }
+    __syncthreads();
+}
+
+__global__ void decodeSoftmaxV2Kernel(__nv_bfloat16 *input, int seq_len) {
+    __shared__ float scores[MAX_SEQ_LEN];
+    __shared__ float partial[256];
+    int row_start = blockIdx.x * seq_len;
+
+    for (int token = threadIdx.x; token < seq_len; token += blockDim.x) {
+        scores[token] = (float)input[row_start + token];
+    }
+    __syncthreads();
+    softmaxSharedRow(scores, partial, seq_len);
+
+    for (int token = threadIdx.x; token < seq_len; token += blockDim.x) {
+        input[row_start + token] = (__nv_bfloat16)scores[token];
+    }
+}
+
 void decodeSoftmax(__nv_bfloat16 *input, int seq_len) {
-    if (seq_len > 1024) {
-        std::cerr << "Decode softmax supports at most 1024 tokens; got " << seq_len << '\n';
+    if (seq_len < 1 || seq_len > MAX_SEQ_LEN) {
+        std::cerr << "Decode softmax supports 1 to " << MAX_SEQ_LEN
+                  << " tokens; got " << seq_len << '\n';
         std::exit(EXIT_FAILURE);
     }
-    softmaxKernel<<<32, seq_len>>>(input, seq_len);
+    decodeSoftmaxV2Kernel<<<32, 256>>>(input, seq_len);
 }
 
 __global__ void causalMaskKernel(__nv_bfloat16 *input, int num_tokens) {
@@ -233,9 +291,9 @@ __global__ void pagedAttentionDecodeKernel(__nv_bfloat16 *q, __nv_bfloat16 *k, _
         partial_token_sum[threadIdx.x] = a * b;
         __syncthreads();
 
-        for (int i = 1; i < 64; i *= 2) {
-            if (threadIdx.x % (2 * i) == 0) {
-                partial_token_sum[threadIdx.x] += partial_token_sum[threadIdx.x + i];
+        for (int stride = 1; stride < 64; stride *= 2) {
+            if (threadIdx.x % (2 * stride) == 0) {
+                partial_token_sum[threadIdx.x] += partial_token_sum[threadIdx.x + stride];
             }
             __syncthreads();
         }
@@ -246,27 +304,7 @@ __global__ void pagedAttentionDecodeKernel(__nv_bfloat16 *q, __nv_bfloat16 *k, _
         __syncthreads();
     }
 
-    if (threadIdx.x == 0) {
-        float max_val = qk[0];
-        float sum = 0;
-
-        for (int i = 0; i < num_tokens; i++) {
-            if (qk[i] > max_val) {
-                max_val = qk[i];
-            }
-        }
-
-        for (int i = 0; i < num_tokens; i++) {
-            qk[i] =  expf(qk[i] - max_val);
-            sum += qk[i];
-        }
-
-        for (int i = 0; i < num_tokens; i++) {
-            qk[i] /= sum;
-        }
-    }
-    __syncthreads();
-
+    softmaxSharedRow(qk, partial_token_sum, num_tokens);
 
     float weighted_sum = 0.0f;
     for (int token = 0; token < num_tokens; token++) {
@@ -281,5 +319,10 @@ __global__ void pagedAttentionDecodeKernel(__nv_bfloat16 *q, __nv_bfloat16 *k, _
 }
 
 void pagedAttentionDecode(__nv_bfloat16 *q, __nv_bfloat16 *k, __nv_bfloat16 *v, __nv_bfloat16 *o, int* device_block_table, int num_tokens, int layer ) {
+    if (num_tokens < 1 || num_tokens > MAX_SEQ_LEN) {
+        std::cerr << "Paged attention supports 1 to " << MAX_SEQ_LEN
+                  << " tokens; got " << num_tokens << '\n';
+        std::exit(EXIT_FAILURE);
+    }
     pagedAttentionDecodeKernel<<<32, 64>>>(q, k, v, o, device_block_table, num_tokens, layer);
 }
