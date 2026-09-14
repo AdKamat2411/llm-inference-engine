@@ -12,3 +12,4 @@ void softmax(__nv_bfloat16 *input, int num_tokens);
 void decodeSoftmax(__nv_bfloat16 *input, int seq_len);
 void causalMask(__nv_bfloat16 *input, int num_tokens);
 void siluMultiply(__nv_bfloat16 *gate, __nv_bfloat16 *up, int num_tokens);
+void pagedAttentionDecode(__nv_bfloat16 *q, __nv_bfloat16 *k, __nv_bfloat16 *v, __nv_bfloat16 *o, int* device_block_table, int num_tokens, int layer );

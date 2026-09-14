@@ -7,6 +7,17 @@
 // Prefill kernels live here (embedding gather, RMSNorm, RoPE, ...).
 // Decode / paged attention come later. Write them as you hit each README section.
 
+constexpr int MAX_PROMPT_LEN = 512;
+constexpr int MAX_SEQ_LEN = 2048;
+constexpr int N_LAYERS = 16;
+constexpr int HIDDEN_SIZE = 2048;
+constexpr int KV_SIZE = 512;
+constexpr int INTERMEDIATE_SIZE = 8192;
+constexpr int VOCAB_SIZE = 128256;
+constexpr int END_OF_SEQ = 128009;
+constexpr int BLOCK_SIZE = 16;
+constexpr int NUM_BLOCKS = 1024;
+
 __global__ void embeddingGatherKernel(int *gpu_input_tokens, __nv_bfloat16 *input_embeddings, __nv_bfloat16 *embed_tokens) {
     int workIndex = threadIdx.x + blockIdx.x * 2048;
     input_embeddings[workIndex] = embed_tokens[gpu_input_tokens[blockIdx.x] * 2048 + threadIdx.x];
@@ -203,4 +214,72 @@ __global__ void siluMultiplyKernel(__nv_bfloat16 *gate, __nv_bfloat16 *up) {
 
 void siluMultiply(__nv_bfloat16 *gate, __nv_bfloat16 *up, int num_tokens) {
     siluMultiplyKernel<<<num_tokens, 1024>>>(gate, up);
+}
+
+__global__ void pagedAttentionDecodeKernel(__nv_bfloat16 *q, __nv_bfloat16 *k, __nv_bfloat16 *v, __nv_bfloat16 *o, int* device_block_table, int num_tokens, int layer) {
+    int q_head_idx = blockIdx.x;
+    int k_head_idx = blockIdx.x / 4;
+    __shared__ float partial_token_sum[64];
+    __shared__ float qk[MAX_SEQ_LEN];
+    __syncthreads();
+
+    for (int i = 0; i < num_tokens; i++) {
+        int physical_block = device_block_table[i / BLOCK_SIZE];
+        int slot = i % BLOCK_SIZE;
+        int offset = ((layer * NUM_BLOCKS + physical_block) * BLOCK_SIZE + slot) * KV_SIZE;
+
+        float a = (float)q[q_head_idx * 64 + threadIdx.x];
+        float b = (float)k[offset + k_head_idx * 64 + threadIdx.x];
+        partial_token_sum[threadIdx.x] = a * b;
+        __syncthreads();
+
+        for (int i = 1; i < 64; i *= 2) {
+            if (threadIdx.x % (2 * i) == 0) {
+                partial_token_sum[threadIdx.x] += partial_token_sum[threadIdx.x + i];
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            qk[i] = partial_token_sum[0] / 8.0f; // scaling by 1/sqrt(64)
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float max_val = qk[0];
+        float sum = 0;
+
+        for (int i = 0; i < num_tokens; i++) {
+            if (qk[i] > max_val) {
+                max_val = qk[i];
+            }
+        }
+
+        for (int i = 0; i < num_tokens; i++) {
+            qk[i] =  expf(qk[i] - max_val);
+            sum += qk[i];
+        }
+
+        for (int i = 0; i < num_tokens; i++) {
+            qk[i] /= sum;
+        }
+    }
+    __syncthreads();
+
+
+    float weighted_sum = 0.0f;
+    for (int token = 0; token < num_tokens; token++) {
+        int physical_block = device_block_table[token / BLOCK_SIZE];
+        int slot = token % BLOCK_SIZE;
+        int offset = ((layer * NUM_BLOCKS + physical_block) * BLOCK_SIZE + slot) * KV_SIZE;
+        float value = (float)v[offset + k_head_idx * 64 + threadIdx.x];
+        weighted_sum += qk[token] * value;
+    }
+    o[q_head_idx * 64 + threadIdx.x] = (__nv_bfloat16)weighted_sum;
+
+}
+
+void pagedAttentionDecode(__nv_bfloat16 *q, __nv_bfloat16 *k, __nv_bfloat16 *v, __nv_bfloat16 *o, int* device_block_table, int num_tokens, int layer ) {
+    pagedAttentionDecodeKernel<<<32, 64>>>(q, k, v, o, device_block_table, num_tokens, layer);
 }
