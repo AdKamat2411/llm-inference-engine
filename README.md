@@ -139,8 +139,7 @@ overprovisioned for a single active request.
 
 ## Current limitations
 
-- The scheduler is structured around multiple requests, but
-  `MAX_ACTIVE_REQUESTS` is currently `1`; decode is not a fused GPU batch.
+- Decode is not a fused GPU batch.
 - Prompts are compiled into the executable rather than accepted through a CLI or
   service interface.
 - Decoding uses greedy argmax, and logits are copied to the CPU for selection.
