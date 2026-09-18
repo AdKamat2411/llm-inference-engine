@@ -1,4 +1,4 @@
-# tiny-vLLM
+# LLM Inference Engine
 
 A small Llama 3.2 1B inference engine written in C++ and CUDA. The project
 implements the model execution path directly, using custom CUDA kernels for
@@ -168,5 +168,7 @@ bench/cache_memory.cu        KV allocation and block-fragmentation probe
 
 ## Acknowledgements
 
-Built as an independent implementation while following the concepts and
-milestones in [AdKamat2411/tiny-vllm](https://github.com/AdKamat2411/tiny-vllm).
+Built while following [Jed Maczan's tiny-vllm](https://github.com/jmaczan/tiny-vllm)
+guide as a learning reference. This implementation follows many of the same
+concepts and milestones, while diverging in parts of the execution path, paged
+KV-cache implementation, scheduling, testing, and benchmarking.
